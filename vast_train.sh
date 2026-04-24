@@ -5,11 +5,8 @@
 # Uso (na instância vast.ai após clonar o repo):
 #   bash vast_train.sh
 #
-# O script:
-#   1. Instala dependências Python (PyTorch CUDA)
-#   2. Baixa dados Binance 15m para BTC, SOL, ETH, DOGE (730 dias)
-#   3. Treina Kronos sequencialmente para cada par
-#   4. Salva modelos em finetune_csv/finetuned/
+# Com múltiplas GPUs (ex: 4x RTX 3090), treina os 4 pares em PARALELO,
+# um símbolo por GPU — reduz tempo de ~4h para ~1h.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -25,118 +22,141 @@ echo "  Kronos vast.ai Training — ${SYMBOLS[*]} / $INTERVAL"
 echo "══════════════════════════════════════════════════════════"
 
 # ── GPU check ─────────────────────────────────────────────────────────────────
+GPU_COUNT=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "0")
+echo "  GPUs disponíveis: $GPU_COUNT"
 python3 -c "
 import torch
-if torch.cuda.is_available():
-    print(f'  GPU: {torch.cuda.get_device_name(0)}')
-    print(f'  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
-else:
-    print('  WARNING: CUDA not available, using CPU')
-"
+for i in range(torch.cuda.device_count()):
+    p = torch.cuda.get_device_properties(i)
+    print(f'  GPU {i}: {p.name} — {p.total_memory/1e9:.1f} GB')
+" 2>/dev/null || echo "  (CUDA não disponível)"
 
 # ── 1. Dependencies ───────────────────────────────────────────────────────────
 echo ""
 echo "▸ Verificando dependências…"
 
 MISSING=""
-python3 -c "import torch" 2>/dev/null     || MISSING="$MISSING torch torchvision"
-python3 -c "import ccxt" 2>/dev/null      || MISSING="$MISSING ccxt"
-python3 -c "import pandas" 2>/dev/null    || MISSING="$MISSING pandas"
-python3 -c "import yaml" 2>/dev/null      || MISSING="$MISSING pyyaml"
+python3 -c "import torch" 2>/dev/null          || MISSING="$MISSING torch torchvision"
+python3 -c "import ccxt" 2>/dev/null           || MISSING="$MISSING ccxt"
+python3 -c "import pandas" 2>/dev/null         || MISSING="$MISSING pandas"
+python3 -c "import yaml" 2>/dev/null           || MISSING="$MISSING pyyaml"
 python3 -c "import huggingface_hub" 2>/dev/null || MISSING="$MISSING huggingface_hub transformers"
 
 if [ -n "$MISSING" ]; then
     echo "  Instalando:$MISSING"
-    # Detecta versão CUDA e instala PyTorch compatível
     CUDA_VER=$(nvidia-smi 2>/dev/null | grep -oP "CUDA Version: \K[0-9.]+" | cut -d. -f1,2 || echo "12.1")
     CUDA_TAG=$(echo "$CUDA_VER" | tr -d '.')
     pip install -q torch torchvision --index-url "https://download.pytorch.org/whl/cu${CUDA_TAG}" 2>/dev/null \
-        || pip install -q torch torchvision  # fallback sem especificar CUDA
+        || pip install -q torch torchvision
     pip install -q ccxt pandas pyyaml huggingface_hub transformers numpy requests
     echo "  Dependências instaladas."
 else
     echo "  Todas as dependências presentes."
 fi
 
-# ── 2. Download Binance data ──────────────────────────────────────────────────
+# ── 2. Download Binance data (sequencial — compartilha rede) ──────────────────
 echo ""
 echo "▸ Baixando dados Binance $INTERVAL ($DAYS dias)…"
 
 for SYMBOL in "${SYMBOLS[@]}"; do
     CSV="$REPO_DIR/finetune_csv/data/BN_${SYMBOL}_${INTERVAL}.csv"
     if [ -f "$CSV" ]; then
-        LINES=$(wc -l < "$CSV")
-        echo "  $SYMBOL: já existe ($LINES linhas)"
+        echo "  $SYMBOL: já existe ($(wc -l < "$CSV") linhas)"
     else
         echo "  $SYMBOL: baixando…"
         PYTHONPATH="$REPO_DIR" python3 -m infra.binance_data_pipeline \
             --symbols "$SYMBOL" --interval "$INTERVAL" --days "$DAYS" \
-            2>&1 | tail -5
+            2>&1 | tail -3
     fi
 done
 
-# ── 3. Train each symbol ──────────────────────────────────────────────────────
+# ── 3. Train — paralelo se múltiplas GPUs, sequencial se 1 GPU ───────────────
 echo ""
-echo "▸ Iniciando treinamento sequencial…"
-echo "  Ordem: ${SYMBOLS[*]}"
-echo ""
-
 TOTAL_START=$(date +%s)
+PIDS=()
 FAILED=()
 
-for SYMBOL in "${SYMBOLS[@]}"; do
-    SYMBOL_LOWER=$(echo "$SYMBOL" | tr '[:upper:]' '[:lower:]')
-    CONFIG="$REPO_DIR/finetune_csv/configs/config_bn_${SYMBOL_LOWER}_${INTERVAL}.yaml"
-    LOG="$LOG_DIR/train_${SYMBOL}_${INTERVAL}.log"
-
-    if [ ! -f "$CONFIG" ]; then
-        echo "  ✗ $SYMBOL: config não encontrada ($CONFIG) — pulando"
-        FAILED+=("$SYMBOL")
-        continue
-    fi
-
-    echo "══════════════════════════════════════════════════════════"
-    echo "  Treinando $SYMBOL/$INTERVAL"
-    echo "  Config : $CONFIG"
-    echo "  Log    : $LOG"
-    echo "══════════════════════════════════════════════════════════"
-
-    SYMBOL_START=$(date +%s)
-
-    if PYTHONPATH="$REPO_DIR" python3 finetune_csv/train_sequential.py \
-            --config "$CONFIG" 2>&1 | tee "$LOG"; then
-        SYMBOL_END=$(date +%s)
-        ELAPSED=$(( (SYMBOL_END - SYMBOL_START) / 60 ))
-        echo ""
-        echo "  ✓ $SYMBOL concluído em ${ELAPSED} min"
-        echo "    Modelo: finetune_csv/finetuned/BN_${SYMBOL}_${INTERVAL}/"
-    else
-        echo "  ✗ $SYMBOL FALHOU — ver $LOG"
-        FAILED+=("$SYMBOL")
-    fi
+if [ "$GPU_COUNT" -ge "${#SYMBOLS[@]}" ]; then
+    # ── Modo paralelo: 1 símbolo por GPU ─────────────────────────────────────
+    echo "▸ Modo PARALELO — ${#SYMBOLS[@]} símbolos em ${#SYMBOLS[@]} GPUs simultâneas"
     echo ""
-done
+
+    for i in "${!SYMBOLS[@]}"; do
+        SYMBOL="${SYMBOLS[$i]}"
+        GPU_ID=$i
+        SYMBOL_LOWER=$(echo "$SYMBOL" | tr '[:upper:]' '[:lower:]')
+        CONFIG="$REPO_DIR/finetune_csv/configs/config_bn_${SYMBOL_LOWER}_${INTERVAL}.yaml"
+        LOG="$LOG_DIR/train_${SYMBOL}_${INTERVAL}.log"
+
+        if [ ! -f "$CONFIG" ]; then
+            echo "  ✗ $SYMBOL: config não encontrada — pulando"
+            continue
+        fi
+
+        echo "  Iniciando $SYMBOL na GPU $GPU_ID → $LOG"
+        CUDA_VISIBLE_DEVICES=$GPU_ID PYTHONPATH="$REPO_DIR" \
+            python3 finetune_csv/train_sequential.py --config "$CONFIG" \
+            > "$LOG" 2>&1 &
+        PIDS+=($!)
+    done
+
+    echo ""
+    echo "  Aguardando conclusão de ${#PIDS[@]} jobs paralelos…"
+    for i in "${!PIDS[@]}"; do
+        PID="${PIDS[$i]}"
+        SYMBOL="${SYMBOLS[$i]}"
+        if wait "$PID"; then
+            echo "  ✓ $SYMBOL concluído"
+        else
+            echo "  ✗ $SYMBOL FALHOU — ver $LOG_DIR/train_${SYMBOL}_${INTERVAL}.log"
+            FAILED+=("$SYMBOL")
+        fi
+    done
+
+else
+    # ── Modo sequencial: 1 GPU para todos ────────────────────────────────────
+    echo "▸ Modo SEQUENCIAL — ${#SYMBOLS[@]} símbolos na GPU 0"
+    echo ""
+
+    for SYMBOL in "${SYMBOLS[@]}"; do
+        SYMBOL_LOWER=$(echo "$SYMBOL" | tr '[:upper:]' '[:lower:]')
+        CONFIG="$REPO_DIR/finetune_csv/configs/config_bn_${SYMBOL_LOWER}_${INTERVAL}.yaml"
+        LOG="$LOG_DIR/train_${SYMBOL}_${INTERVAL}.log"
+
+        if [ ! -f "$CONFIG" ]; then
+            echo "  ✗ $SYMBOL: config não encontrada — pulando"
+            FAILED+=("$SYMBOL")
+            continue
+        fi
+
+        echo "══════════════════════════════════════════════════════════"
+        echo "  Treinando $SYMBOL/$INTERVAL → $LOG"
+        SYMBOL_START=$(date +%s)
+
+        if PYTHONPATH="$REPO_DIR" python3 finetune_csv/train_sequential.py \
+                --config "$CONFIG" 2>&1 | tee "$LOG"; then
+            ELAPSED=$(( ($(date +%s) - SYMBOL_START) / 60 ))
+            echo "  ✓ $SYMBOL concluído em ${ELAPSED} min"
+        else
+            echo "  ✗ $SYMBOL FALHOU"
+            FAILED+=("$SYMBOL")
+        fi
+    done
+fi
 
 # ── 4. Summary ────────────────────────────────────────────────────────────────
-TOTAL_END=$(date +%s)
-TOTAL_MIN=$(( (TOTAL_END - TOTAL_START) / 60 ))
+TOTAL_MIN=$(( ($(date +%s) - TOTAL_START) / 60 ))
 
-echo "══════════════════════════════════════════════════════════"
-echo "  TREINAMENTO CONCLUÍDO"
-echo "══════════════════════════════════════════════════════════"
-echo "  Tempo total: ${TOTAL_MIN} min"
 echo ""
-echo "  Modelos salvos:"
+echo "══════════════════════════════════════════════════════════"
+echo "  TREINAMENTO CONCLUÍDO em ${TOTAL_MIN} min"
+echo "══════════════════════════════════════════════════════════"
 for SYMBOL in "${SYMBOLS[@]}"; do
-    SYMBOL_LOWER=$(echo "$SYMBOL" | tr '[:upper:]' '[:lower:]')
     DIR="$REPO_DIR/finetune_csv/finetuned/BN_${SYMBOL}_${INTERVAL}"
-    if [ -d "$DIR" ]; then
-        echo "  ✓ $SYMBOL → $DIR/"
-    fi
+    [ -d "$DIR" ] && echo "  ✓ $SYMBOL → $DIR/"
 done
 
 if [ ${#FAILED[@]} -gt 0 ]; then
-    echo ""
     echo "  Falhas: ${FAILED[*]}"
     exit 1
 fi
