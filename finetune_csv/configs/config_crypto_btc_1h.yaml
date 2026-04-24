@@ -1,0 +1,59 @@
+# Fine-tune do Kronos em dados reais de BTC/1h da Hyperliquid
+#
+# ANTES DE RODAR:
+#   1. python -m infra.crypto_data_pipeline --coin BTC --interval 1h --days 730
+#   2. Ajuste base_path abaixo para o caminho absoluto do seu projeto
+#   3. python finetune_csv/train_sequential.py --config finetune_csv/configs/config_crypto_btc_1h.yaml
+
+data:
+  data_path: "finetune_csv/data/HL_BTC_1h.csv"
+  lookback_window: 512
+  predict_window: 24          # prever as próximas 24h
+  max_context: 512
+  clip: 5.0
+  train_ratio: 0.85
+  val_ratio: 0.10
+  test_ratio: 0.05
+
+training:
+  tokenizer_epochs: 30
+  basemodel_epochs: 20
+  batch_size: 32
+  log_interval: 50
+  num_workers: 4
+  seed: 42
+
+  tokenizer_learning_rate: 0.0002
+  predictor_learning_rate: 0.000001
+
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_weight_decay: 0.1
+  accumulation_steps: 2       # útil se GPU com pouca VRAM
+
+model_paths:
+  pretrained_tokenizer: "NeoQuasar/Kronos-Tokenizer-base"
+  pretrained_predictor: "NeoQuasar/Kronos-small"
+
+  exp_name: "HL_BTC_1h"
+  base_path: "finetune_csv/finetuned"
+
+  base_save_path: ""          # gerado automaticamente: base_path/exp_name
+  finetuned_tokenizer: ""     # gerado automaticamente
+
+  tokenizer_save_name: "tokenizer"
+  basemodel_save_name: "basemodel"
+
+experiment:
+  name: "kronos_hl_btc_1h"
+  description: "Kronos fine-tuned on Hyperliquid BTC/1h perpetual"
+  use_comet: false
+  train_tokenizer: true
+  train_basemodel: true
+  skip_existing: false
+  pre_trained_tokenizer: true
+  pre_trained_predictor: true
+
+device:
+  use_cuda: true
+  device_id: 0

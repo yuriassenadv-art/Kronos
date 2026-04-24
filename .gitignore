@@ -74,3 +74,12 @@ venv.bak/
 temp/
 tmp/
 .python-version
+
+# Training data CSVs (large files, generated locally)
+finetune_csv/data/*.csv
+
+# Fine-tuned model weights (large binaries)
+finetune_csv/finetuned/
+
+# safetensors model files
+*.safetensors
