@@ -70,6 +70,26 @@ class EnsemblePredictor:  # placeholder usado só para spec dos MagicMocks
 
 _ep_stub.EnsemblePredictor = EnsemblePredictor
 
+# Stub do hyperliquid.info.Info — necessário pelos testes de size precision
+# do order_executor (e idempotente para outros agentes que stubam o mesmo).
+_hl_pkg = _ensure_stub("hyperliquid")
+_hl_info_mod = _ensure_stub("hyperliquid.info")
+if not hasattr(_hl_info_mod, "Info"):
+    class _StubInfo:  # placeholder; testes substituem via patch()
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def meta(self):
+            return {"universe": []}
+
+        def all_mids(self):
+            return {}
+
+        def user_state(self, *args, **kwargs):
+            return {"marginSummary": {"accountValue": "0"}}
+
+    _hl_info_mod.Info = _StubInfo
+
 # Agora podemos importar com segurança o resto da stack
 from trading.config import Config, TradingConfig
 from trading.signal_generator import Signal, Direction
@@ -431,6 +451,124 @@ class TestPortfolio:
         # Direções corretas
         assert result["BTC"].is_buy is True   # LONG
         assert result["ETH"].is_buy is False  # SHORT
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestSizePrecision — _load_sz_decimals e _round_qty (BLOCKER #3)
+# ─────────────────────────────────────────────────────────────────────────────
+class TestSizePrecision:
+    """Cobre _load_sz_decimals e _round_qty para size precision por coin."""
+
+    def setup_method(self):
+        # Limpa cache entre testes
+        from trading.order_executor import clear_decimals_cache
+        clear_decimals_cache()
+
+    def test_round_qty_uses_per_coin_decimals(self):
+        from trading.order_executor import _round_qty
+        from unittest.mock import patch
+
+        fake_meta = {
+            "universe": [
+                {"name": "BTC", "szDecimals": 5},
+                {"name": "ETH", "szDecimals": 4},
+                {"name": "SOL", "szDecimals": 2},
+            ]
+        }
+        with patch("trading.order_executor.Info") as mock_info_cls:
+            mock_info_cls.return_value.meta.return_value = fake_meta
+
+            # BTC permite 5 decimais
+            assert _round_qty("BTC", 0.123456789, "https://x") == 0.12346
+            # ETH limita a 4
+            assert _round_qty("ETH", 0.123456789, "https://x") == 0.1235
+            # SOL limita a 2
+            assert _round_qty("SOL", 1.234567, "https://x") == 1.23
+
+    def test_round_qty_fallback_for_unknown_coin(self):
+        from trading.order_executor import _round_qty
+        from unittest.mock import patch
+
+        with patch("trading.order_executor.Info") as mock_info_cls:
+            mock_info_cls.return_value.meta.return_value = {"universe": []}
+            # Coin desconhecido cai no fallback (4 decimais)
+            assert _round_qty("XYZ", 0.123456, "https://x") == 0.1235
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestPositionWatcher — sync_positions reconcilia state com a exchange
+# ─────────────────────────────────────────────────────────────────────────────
+class TestPositionWatcher:
+    """Cobre sync_positions: fecha state quando exchange não tem mais a posição."""
+
+    def test_sync_positions_dry_run_returns_empty(self, state):
+        from trading.config import HyperliquidConfig
+        from infra.position_watcher import sync_positions
+        # dry_run=True nunca consulta a exchange
+        closed = sync_positions(state, HyperliquidConfig(), dry_run=True)
+        assert closed == []
+
+    def test_sync_positions_clears_state_when_position_closed_on_exchange(
+        self, state
+    ):
+        from trading.config import HyperliquidConfig
+        from infra.position_watcher import sync_positions
+
+        # Pré-popula state com posição BTC
+        state.set_position(OpenPosition(
+            coin="BTC", direction="LONG", entry_price=50000.0,
+            size_usd=30.0, sl_price=49250.0, tp_price=51500.0,
+            opened_at=time.time(),
+        ))
+
+        # Mock: exchange retorna nenhuma posição aberta
+        fake_user_state = {"assetPositions": [], "marginSummary": {}}
+        with patch(
+            "infra.position_watcher.Info"
+        ) as mock_info_cls, patch(
+            "infra.position_watcher.monitor"
+        ):
+            mock_info_cls.return_value.user_state.return_value = fake_user_state
+            closed = sync_positions(
+                state, HyperliquidConfig(), dry_run=False
+            )
+
+        # State deve ter sido limpo
+        assert "BTC" in closed
+        assert state.has_open_position("BTC") is False
+
+    def test_sync_positions_keeps_state_when_position_still_open(
+        self, state
+    ):
+        from trading.config import HyperliquidConfig
+        from infra.position_watcher import sync_positions
+
+        state.set_position(OpenPosition(
+            coin="BTC", direction="LONG", entry_price=50000.0,
+            size_usd=30.0, sl_price=49250.0, tp_price=51500.0,
+            opened_at=time.time(),
+        ))
+
+        # Mock: exchange ainda mostra BTC com size > 0
+        fake_user_state = {
+            "assetPositions": [
+                {"position": {"coin": "BTC", "szi": "0.001", "entryPx": "50000"}}
+            ],
+            "marginSummary": {},
+        }
+        with patch(
+            "infra.position_watcher.Info"
+        ) as mock_info_cls, patch(
+            "infra.position_watcher.monitor"
+        ):
+            mock_info_cls.return_value.user_state.return_value = fake_user_state
+            closed = sync_positions(
+                state, HyperliquidConfig(), dry_run=False
+            )
+
+        # Posição segue aberta, nada limpo
+        assert closed == []
+        assert state.has_open_position("BTC") is True
 
 
 # ─────────────────────────────────────────────────────────────────────────────

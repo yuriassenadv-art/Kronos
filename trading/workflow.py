@@ -22,6 +22,7 @@ from trading.order_executor import get_account_balance, place_order
 from trading.portfolio import allocate_capital
 from infra.ensemble_predictor import EnsemblePredictor
 from infra.state_manager import StateManager, OpenPosition
+from infra.position_watcher import sync_positions
 from infra import monitor
 
 logging.basicConfig(
@@ -301,6 +302,25 @@ def run_cycle(
         tcfg.dry_run,
     )
 
+    # 0. Sync de posições — detecta SL/TP disparados ENTRE ciclos.
+    # Sem isso, posições fechadas pela exchange ficam "fantasma" no state
+    # e bloqueiam a reabertura via filter_already_open.
+    try:
+        closed = sync_positions(state, cfg.hyperliquid, tcfg.dry_run)
+        if closed:
+            logger.warning(
+                "Sync de posições: %d fechada(s) detectada(s): %s",
+                len(closed), ", ".join(closed),
+            )
+        else:
+            logger.info("Posições em sync com a exchange.")
+    except Exception as exc:
+        # sync_positions já trata erros internamente, mas guard extra
+        # garante que NUNCA derrube o ciclo.
+        err = traceback.format_exc()
+        logger.warning("Falha em sync_positions (não-fatal): %s", exc)
+        monitor.alert_error("sync_positions", err)
+
     # 1. Sinais
     signals = generate_signals(ensembles, cfg)
     if not signals:
@@ -393,6 +413,18 @@ def main():
 
     state = StateManager()
     cycle = 0
+
+    # Reconciliação on startup: detecta posições "fantasma" (state.json
+    # desincronizado da exchange — ex: bot crashou + SL/TP disparou enquanto offline).
+    logger.info("Reconciliação de startup: comparando state.json com exchange…")
+    closed = sync_positions(state, cfg.hyperliquid, cfg.trading.dry_run)
+    if closed:
+        logger.warning(
+            "Removidas %d posição(ões) fantasma do state: %s",
+            len(closed), ", ".join(closed)
+        )
+    else:
+        logger.info("State em sync com a exchange.")
 
     logger.info(
         "Loop multi-asset iniciado | coins=%s | %s | dry_run=%s | sample_count=%d",

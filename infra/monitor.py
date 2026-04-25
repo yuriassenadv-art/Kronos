@@ -59,6 +59,15 @@ def alert_order_placed(coin: str, direction: str, size_usd: float,
     )
 
 
+def alert_position_closed(coin: str, direction: str, reason: str):
+    _send(
+        f"🟢 *Posição fechada*\n"
+        f"Par: `{coin}`\n"
+        f"Direção: `{direction}`\n"
+        f"Motivo: `{reason}`"
+    )
+
+
 def alert_error(context: str, error: str):
     _send(f"❌ *Erro — {context}*\n```\n{error[:400]}\n```")
 

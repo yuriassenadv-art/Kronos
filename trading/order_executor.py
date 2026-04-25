@@ -7,16 +7,62 @@ Instale: pip install hyperliquid-python-sdk
 import logging
 from typing import Optional
 
+from hyperliquid.info import Info
+
 from .config import HyperliquidConfig, TradingConfig
 from .risk_manager import OrderParams
 
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Size precision por coin (BLOCKER #3)
+# ─────────────────────────────────────────────────────────────────────────────
+# A Hyperliquid expõe os decimais de quantidade (`szDecimals`) por ativo via
+# `Info.meta()["universe"]`. Cada coin tem um valor diferente:
+#   BTC=5, ETH=4, SOL=2, …
+# Hardcodar `5` decimais na conversão `qty = round(size_usd / mid_price, 5)`
+# quebra para coins com tick maior (ex: SOL com 0.001 SOL é INVÁLIDO e a
+# exchange rejeita a ordem). Cacheamos o mapping em memória para evitar
+# fetch repetido a cada ordem.
+_SZ_DECIMALS_CACHE: Optional[dict[str, int]] = None
+
+
+def _load_sz_decimals(base_url: str) -> dict[str, int]:
+    """
+    Carrega o mapping coin -> szDecimals da Hyperliquid `meta` endpoint.
+    Cacheado em memória para evitar fetch repetido a cada ordem.
+    """
+    global _SZ_DECIMALS_CACHE
+    if _SZ_DECIMALS_CACHE is not None:
+        return _SZ_DECIMALS_CACHE
+
+    info = Info(base_url, skip_ws=True)
+    meta = info.meta()
+    _SZ_DECIMALS_CACHE = {
+        asset["name"]: int(asset["szDecimals"])
+        for asset in meta.get("universe", [])
+    }
+    return _SZ_DECIMALS_CACHE
+
+
+def _round_qty(coin: str, qty_raw: float, base_url: str) -> float:
+    """
+    Arredonda quantidade para o szDecimals do ativo.
+    Fallback: 4 decimais (mais conservador que 5).
+    """
+    decimals = _load_sz_decimals(base_url).get(coin, 4)
+    return round(qty_raw, decimals)
+
+
+def clear_decimals_cache() -> None:
+    """Reset do cache de szDecimals — útil em testes."""
+    global _SZ_DECIMALS_CACHE
+    _SZ_DECIMALS_CACHE = None
+
+
 def get_account_balance(hl_cfg: HyperliquidConfig) -> float:
     """Retorna o saldo USDC disponível na conta."""
-    from hyperliquid.info import Info
-
     info = Info(hl_cfg.base_url, skip_ws=True)
     state = info.user_state(hl_cfg.account_address)
     return float(state["marginSummary"]["accountValue"])
@@ -59,10 +105,25 @@ def place_order(
 
     # Tamanho em moeda base (ex: BTC)
     # Precisamos do preço atual para converter USD → qty
-    from hyperliquid.info import Info
     info = Info(hl_cfg.base_url, skip_ws=True)
     mid_price = float(info.all_mids()[params.coin])
-    qty = round(params.size_usd / mid_price, 5)
+    qty = _round_qty(params.coin, params.size_usd / mid_price, hl_cfg.base_url)
+
+    # Validação preventiva: se o size_usd é menor que 1 unidade do tick
+    # (qty arredonda para 0), abortamos a ordem com warning. Sem isso, a
+    # exchange rejeitaria com mensagem genérica e perderíamos o ciclo.
+    if qty == 0:
+        decimals_used = _load_sz_decimals(hl_cfg.base_url).get(params.coin, 4)
+        logger.warning(
+            "Ordem abortada: qty arredondada para 0 | coin=%s "
+            "size_usd=$%.2f mid_price=%.2f szDecimals=%d. "
+            "Aumente size_usd ou reduza precisão.",
+            params.coin,
+            params.size_usd,
+            mid_price,
+            decimals_used,
+        )
+        return None
 
     # Ordem market com SL/TP
     order_result = exchange.market_open(
