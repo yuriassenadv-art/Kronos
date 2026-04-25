@@ -352,8 +352,11 @@ Environment="TELEGRAM_CHAT_ID=987654321"
 Environment="HYPERLIQUID_PRIVATE_KEY=0x..."
 Environment="HYPERLIQUID_ACCOUNT_ADDRESS=0x..."
 ExecStart=/usr/bin/python3 -m trading.workflow
+# Auto-restart: o bot sai com exit 1 quando detecta falha terminal de
+# carregamento de modelo ou ≥2 health checks consecutivos. systemd reinicia
+# automaticamente após RestartSec.
 Restart=on-failure
-RestartSec=30
+RestartSec=10
 StandardOutput=append:/var/log/kronos-bot.log
 StandardError=append:/var/log/kronos-bot.err
 

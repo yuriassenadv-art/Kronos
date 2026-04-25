@@ -572,6 +572,285 @@ class TestPositionWatcher:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TestRetryDecorator — retry_on_network_error com backoff exponencial
+# ─────────────────────────────────────────────────────────────────────────────
+class TestRetryDecorator:
+    """Cobre retry_on_network_error: retry em network error, fail fast em 4xx."""
+
+    def test_retry_succeeds_after_transient_failure(self):
+        from infra.retry import retry_on_network_error
+        import requests
+        calls = []
+
+        @retry_on_network_error(max_attempts=3, base_delay=0.01)
+        def flaky():
+            calls.append(1)
+            if len(calls) < 3:
+                raise requests.exceptions.ConnectionError("transient")
+            return "ok"
+
+        assert flaky() == "ok"
+        assert len(calls) == 3
+
+    def test_retry_gives_up_after_max_attempts(self):
+        from infra.retry import retry_on_network_error
+        import requests
+
+        @retry_on_network_error(max_attempts=2, base_delay=0.01)
+        def always_fails():
+            raise requests.exceptions.ConnectionError("nope")
+
+        with pytest.raises(requests.exceptions.ConnectionError):
+            always_fails()
+
+    def test_retry_does_not_retry_on_value_error(self):
+        from infra.retry import retry_on_network_error
+        calls = []
+
+        @retry_on_network_error(max_attempts=3, base_delay=0.01)
+        def bad_input():
+            calls.append(1)
+            raise ValueError("4xx-like")
+
+        with pytest.raises(ValueError):
+            bad_input()
+        assert len(calls) == 1  # nenhum retry
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestOrderFillVerification — validação de status / fills no place_order
+# ─────────────────────────────────────────────────────────────────────────────
+class TestOrderFillVerification:
+    """Cobre validação de status / fills no place_order."""
+
+    def setup_method(self):
+        # Garante que cada teste reinicializa cache de szDecimals
+        from trading.order_executor import clear_decimals_cache
+        clear_decimals_cache()
+
+    def _stub_hyperliquid_modules(self):
+        """
+        Garante que os módulos lazy-imported por place_order existem em
+        sys.modules antes do patch (Exchange, hyperliquid.utils.constants,
+        eth_account). Sem isso, `from hyperliquid.exchange import Exchange`
+        dentro da função estoura ImportError.
+        """
+        _ensure_stub("hyperliquid.exchange")
+        if not hasattr(sys.modules["hyperliquid.exchange"], "Exchange"):
+            sys.modules["hyperliquid.exchange"].Exchange = type(
+                "Exchange", (), {}
+            )
+        _ensure_stub("hyperliquid.utils")
+        _ensure_stub("hyperliquid.utils.constants")
+        sys.modules["hyperliquid.utils"].constants = sys.modules[
+            "hyperliquid.utils.constants"
+        ]
+        sys.modules["hyperliquid.utils.constants"].MAINNET_API_URL = "x"
+        sys.modules["hyperliquid.utils.constants"].TESTNET_API_URL = "y"
+        _ensure_stub("eth_account")
+        if not hasattr(sys.modules["eth_account"], "Account"):
+            class _StubAccount:
+                @staticmethod
+                def from_key(_key):
+                    return None
+            sys.modules["eth_account"].Account = _StubAccount
+
+    def test_place_order_returns_none_when_status_err(self, cfg):
+        from trading.order_executor import place_order
+        from trading.risk_manager import OrderParams
+        from unittest.mock import patch, MagicMock
+
+        self._stub_hyperliquid_modules()
+
+        params = OrderParams(
+            coin="BTC", is_buy=True, size_usd=30.0,
+            sl_price=49000.0, tp_price=51000.0, leverage=3,
+        )
+        cfg.trading.dry_run = False  # força fluxo live para validar
+
+        # Info / Exchange / eth_account / constants — mockados nas suas origens
+        # (Exchange e eth_account são lazy-imported dentro de place_order).
+        mock_info = MagicMock()
+        mock_info.all_mids.return_value = {"BTC": "50000"}
+        mock_info.meta.return_value = {
+            "universe": [{"name": "BTC", "szDecimals": 5}]
+        }
+        mock_exchange = MagicMock()
+        mock_exchange.market_open.return_value = {
+            "status": "err", "response": "rejected"
+        }
+        mock_account = MagicMock()
+
+        with patch("trading.order_executor.Info", return_value=mock_info), \
+             patch(
+                 "hyperliquid.exchange.Exchange", return_value=mock_exchange
+             ), \
+             patch(
+                 "eth_account.Account.from_key", return_value=mock_account
+             ), \
+             patch("trading.order_executor.monitor"):
+            result = place_order(params, cfg.hyperliquid, cfg.trading)
+
+        # Status err → return None, NÃO envia SL/TP
+        assert result is None
+        mock_exchange.order.assert_not_called()  # SL/TP nunca enviado
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestHealthCheck — build_ensembles_with_retry + ensemble_health_check
+# ─────────────────────────────────────────────────────────────────────────────
+class TestHealthCheck:
+    """Cobre build_ensembles_with_retry e ensemble_health_check."""
+
+    def setup_method(self):
+        from infra.health_check import reset_health_state
+        reset_health_state()
+
+    def test_build_ensembles_with_retry_succeeds_after_transient_failure(self):
+        from infra.health_check import build_ensembles_with_retry
+        from unittest.mock import MagicMock
+        import time as time_mod
+
+        attempts = []
+
+        def flaky_builder():
+            attempts.append(1)
+            if len(attempts) < 2:
+                raise RuntimeError("disco lento")
+            return {"BTC": MagicMock()}
+
+        # Patch sleep para não esperar de verdade no teste
+        with patch.object(time_mod, "sleep"):
+            from infra import health_check
+            with patch.object(health_check, "time") as mock_time:
+                ensembles = build_ensembles_with_retry(
+                    flaky_builder, max_attempts=3, base_delay=0.01,
+                )
+        assert "BTC" in ensembles
+        assert len(attempts) == 2
+
+    def test_build_ensembles_with_retry_exits_after_max_attempts(self):
+        from infra.health_check import build_ensembles_with_retry
+
+        def always_fails():
+            raise RuntimeError("modelo corrompido")
+
+        with patch("infra.health_check.time"):
+            with pytest.raises(SystemExit) as exc_info:
+                build_ensembles_with_retry(
+                    always_fails, max_attempts=2, base_delay=0.01,
+                )
+        assert exc_info.value.code == 1
+
+    def test_ensemble_health_check_passes_when_at_least_one_ok(self):
+        from infra.health_check import ensemble_health_check, reset_health_state
+
+        reset_health_state()
+
+        ok_ensemble = MagicMock()
+        ok_ensemble.get_signal.return_value = MagicMock()
+
+        bad_ensemble = MagicMock()
+        bad_ensemble.get_signal.side_effect = RuntimeError("OOM")
+
+        result = ensemble_health_check(
+            {"BTC": ok_ensemble, "ETH": bad_ensemble}
+        )
+        assert result is True
+
+    def test_ensemble_health_check_exits_after_consecutive_total_failures(self):
+        from infra.health_check import ensemble_health_check, reset_health_state
+
+        reset_health_state()
+
+        bad_ensemble = MagicMock()
+        bad_ensemble.get_signal.side_effect = RuntimeError("OOM")
+
+        # Primeira falha: não sai (< 2 consecutivos)
+        result = ensemble_health_check({"BTC": bad_ensemble})
+        assert result is False
+
+        # Segunda falha total → sys.exit(1)
+        with pytest.raises(SystemExit) as exc_info:
+            ensemble_health_check({"BTC": bad_ensemble})
+        assert exc_info.value.code == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestFundingPenalty — funding_penalty: penaliza LONG/SHORT em funding
+# adverso, sem penalidade quando funding está abaixo do threshold.
+# ─────────────────────────────────────────────────────────────────────────────
+class TestFundingPenalty:
+    """Cobre funding_penalty: penaliza LONG em funding alto e SHORT em funding negativo."""
+
+    def setup_method(self):
+        from infra.funding import clear_cache
+        clear_cache()
+
+    def test_no_penalty_when_funding_neutral(self):
+        from infra.funding import funding_penalty, _FUNDING_CACHE
+        _FUNDING_CACHE["BTC"] = 0.00005  # abaixo do threshold padrão
+        assert funding_penalty("BTC", is_long=True) == 1.0
+        assert funding_penalty("BTC", is_long=False) == 1.0
+
+    def test_long_penalty_when_funding_high_positive(self):
+        from infra.funding import funding_penalty, _FUNDING_CACHE
+        _FUNDING_CACHE["BTC"] = 0.0005  # 5x o threshold
+        # LONG paga funding positivo → penalidade máxima (0.5)
+        assert funding_penalty("BTC", is_long=True) == pytest.approx(0.5)
+        # SHORT recebe → sem penalidade
+        assert funding_penalty("BTC", is_long=False) == 1.0
+
+    def test_short_penalty_when_funding_high_negative(self):
+        from infra.funding import funding_penalty, _FUNDING_CACHE
+        _FUNDING_CACHE["BTC"] = -0.0005  # 5x abaixo do threshold negativo
+        # SHORT paga funding negativo → penalidade máxima
+        assert funding_penalty("BTC", is_long=False) == pytest.approx(0.5)
+        # LONG recebe → sem penalidade
+        assert funding_penalty("BTC", is_long=True) == 1.0
+
+    def test_penalty_floor_at_05(self):
+        from infra.funding import funding_penalty, _FUNDING_CACHE
+        _FUNDING_CACHE["BTC"] = 1.0  # absurdamente alto
+        # Mesmo em valores extremos, floor em 0.5
+        assert funding_penalty("BTC", is_long=True) == pytest.approx(0.5)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestPortfolioWithFunding — integração de funding_penalty no allocate_capital
+# ─────────────────────────────────────────────────────────────────────────────
+class TestPortfolioWithFunding:
+    """Cobre integração de funding_penalty no allocate_capital."""
+
+    def setup_method(self):
+        from infra.funding import clear_cache
+        clear_cache()
+
+    def test_allocate_capital_reduces_long_weight_when_funding_high(self, cfg):
+        from infra.funding import _FUNDING_CACHE
+        from trading.portfolio import allocate_capital
+
+        # Funding alto positivo no BTC penaliza LONG
+        _FUNDING_CACHE["BTC"] = 0.0005   # 5x threshold
+        _FUNDING_CACHE["ETH"] = 0.0       # neutro
+
+        signals = {
+            "BTC": Signal(Direction.LONG, 0.8, 50000.0, 10, "btc"),
+            "ETH": Signal(Direction.LONG, 0.4, 3000.0, 10, "eth"),
+        }
+        result = allocate_capital(signals, balance=1000.0, cfg=cfg.trading)
+
+        # BTC ainda deve receber maior alocação (confidence 0.8 > 0.4),
+        # mas com penalidade aplicada — proporção BTC/ETH deve ser menor
+        # que confidence pura (0.8/0.4 = 2.0)
+        ratio = result["BTC"].size_usd / result["ETH"].size_usd
+        # Com penalty 0.5 em BTC: peso BTC = 0.8 × 0.5 = 0.4, ETH = 0.4 × 1.0 = 0.4
+        # Ratio esperado ~= 1.0 (igualdade após penalidade)
+        assert ratio < 2.0  # penalidade reduz a vantagem do BTC
+        assert ratio == pytest.approx(1.0, rel=1e-2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TestWorkflowIntegration — run_cycle não crashea quando portfolio falha
 # ─────────────────────────────────────────────────────────────────────────────
 class TestWorkflowIntegration:

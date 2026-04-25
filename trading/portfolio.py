@@ -4,13 +4,22 @@ Portfolio Manager — Camada de alocação multi-asset.
 Decide como dividir o capital disponível entre múltiplos sinais
 direcionais simultâneos (BTC, ETH, SOL).
 
-Implementação ativa: Filosofia B — Confidence-weighted.
+Implementação ativa: Filosofia B — Confidence-weighted + funding penalty.
 Usa o `signal.confidence` (já calibrado pelo agreement_score do ensemble)
 como peso de alocação proporcional. O coin com sinal mais forte recebe
 fatia maior do risco; sinais fracos recebem fatia menor.
+
+Camada extra: funding rate awareness. Antes de normalizar os pesos finais,
+aplicamos `funding_penalty` por coin/direção — se o funding atual penaliza
+a direção do trade (LONG em funding alto positivo, SHORT em funding alto
+negativo), o peso é reduzido em até 50% (floor 0.5x). Após a penalidade
+re-normalizamos para que a soma dos pesos volte a 1.0 — o capital
+preservado é redistribuído entre os sinais com funding favorável.
 """
 from dataclasses import replace
 from typing import Optional
+
+from infra.funding import funding_penalty
 
 from .config import TradingConfig
 from .signal_generator import Signal, Direction
@@ -116,6 +125,21 @@ def allocate_capital(
     # 3. Pesos normalizados pela soma das confidences.
     total_conf = sum(s.confidence for s in active.values())
     weights = {coin: sig.confidence / total_conf for coin, sig in active.items()}
+
+    # 3b. Aplicar penalidade de funding desfavorável à direção.
+    # LONG em funding alto positivo paga juros; SHORT em funding alto negativo
+    # idem. funding_penalty retorna multiplicador em [0.5, 1.0].
+    adjusted_weights: dict[str, float] = {}
+    for coin, sig in active.items():
+        is_long = sig.direction == Direction.LONG
+        penalty = funding_penalty(coin, is_long)
+        adjusted_weights[coin] = weights[coin] * penalty
+
+    # 3c. Re-normalizar (após penalidades, soma pode ser < 1.0).
+    total = sum(adjusted_weights.values())
+    if total <= 0:
+        return {}
+    weights = {coin: w / total for coin, w in adjusted_weights.items()}
 
     # 4. Para cada coin: cfg.copy() ajustado com risco fatiado pelo peso.
     allocations: dict[str, OrderParams] = {}

@@ -4,6 +4,8 @@ import pandas as pd
 from datetime import datetime, timedelta
 from typing import Optional
 
+from infra.retry import retry_on_network_error
+
 from .config import TradingConfig
 
 INTERVAL_TO_MS = {
@@ -16,6 +18,7 @@ INTERVAL_TO_MS = {
 }
 
 
+@retry_on_network_error(max_attempts=3, base_delay=1.0)
 def fetch_candles(
     coin: str,
     interval: str,

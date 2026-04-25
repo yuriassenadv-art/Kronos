@@ -26,6 +26,7 @@ from typing import Any
 
 from infra.state_manager import StateManager
 from infra import monitor
+from infra.retry import retry_on_network_error
 from trading.config import HyperliquidConfig
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,17 @@ try:
     from hyperliquid.info import Info  # type: ignore
 except Exception:  # pragma: no cover — só dispara em ambientes sem o SDK
     Info = None  # type: ignore
+
+
+@retry_on_network_error(max_attempts=3, base_delay=1.0)
+def _fetch_user_state(hl_cfg: HyperliquidConfig) -> dict[str, Any]:
+    """
+    Consulta `Info.user_state` com retry/backoff em falhas de rede.
+    Isolado em helper para que o decorator atue apenas na chamada de rede,
+    sem interferir na lógica de reconciliação em `sync_positions`.
+    """
+    info = Info(hl_cfg.base_url, skip_ws=True)
+    return info.user_state(hl_cfg.account_address)
 
 
 def _exchange_open_coins(user_state: dict[str, Any]) -> set[str]:
@@ -115,8 +127,7 @@ def sync_positions(
         return []
 
     try:
-        info = Info(hl_cfg.base_url, skip_ws=True)
-        user_state = info.user_state(hl_cfg.account_address)
+        user_state = _fetch_user_state(hl_cfg)
     except Exception as exc:
         logger.warning(
             "sync_positions: falha ao consultar Hyperliquid user_state: %s. "

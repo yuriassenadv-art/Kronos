@@ -9,6 +9,9 @@ from typing import Optional
 
 from hyperliquid.info import Info
 
+from infra import monitor
+from infra.retry import retry_on_network_error
+
 from .config import HyperliquidConfig, TradingConfig
 from .risk_manager import OrderParams
 
@@ -28,6 +31,7 @@ logger = logging.getLogger(__name__)
 _SZ_DECIMALS_CACHE: Optional[dict[str, int]] = None
 
 
+@retry_on_network_error(max_attempts=3, base_delay=1.0)
 def _load_sz_decimals(base_url: str) -> dict[str, int]:
     """
     Carrega o mapping coin -> szDecimals da Hyperliquid `meta` endpoint.
@@ -61,6 +65,7 @@ def clear_decimals_cache() -> None:
     _SZ_DECIMALS_CACHE = None
 
 
+@retry_on_network_error(max_attempts=3, base_delay=1.0)
 def get_account_balance(hl_cfg: HyperliquidConfig) -> float:
     """Retorna o saldo USDC disponível na conta."""
     info = Info(hl_cfg.base_url, skip_ws=True)
@@ -133,6 +138,60 @@ def place_order(
         slippage=0.01,
     )
     logger.info("Ordem enviada: %s", order_result)
+
+    # ─── Validação de fill (Gap #4) ───────────────────────────────────────
+    # Antes de enviar SL/TP ou persistir state, validamos:
+    #   1. status global == "ok"
+    #   2. pelo menos 1 status com "filled" no payload de retorno
+    # Caso contrário, abortamos cedo e alertamos via Telegram.
+    if order_result.get("status") != "ok":
+        logger.error(
+            "[%s] Ordem REJEITADA — status=%s | response=%s",
+            params.coin, order_result.get("status"), order_result,
+        )
+        monitor.alert_error(
+            f"order_rejected_{params.coin}",
+            f"Hyperliquid rejeitou: {order_result}",
+        )
+        return None
+
+    statuses = (
+        order_result.get("response", {})
+        .get("data", {})
+        .get("statuses", [])
+    )
+    filled = [s for s in statuses if isinstance(s, dict) and "filled" in s]
+    if not filled:
+        logger.error(
+            "[%s] Ordem retornou ok sem fill — statuses=%s",
+            params.coin, statuses,
+        )
+        monitor.alert_error(
+            f"order_no_fill_{params.coin}",
+            f"Sem fill: {statuses}",
+        )
+        return None
+
+    # Extrair preço médio realmente executado para refletir slippage real
+    avg_px = float(filled[0]["filled"].get("avgPx", mid_price))
+    filled_qty = float(filled[0]["filled"].get("totalSz", qty))
+    logger.info(
+        "[%s] Fill confirmado: avg_px=%.4f | qty=%.6f",
+        params.coin, avg_px, filled_qty,
+    )
+
+    # Recalcular SL/TP sobre avg_px real (em vez de signal.entry_price)
+    # para refletir slippage real:
+    if params.is_buy:
+        actual_sl = avg_px * (1 - trading_cfg.sl_pct / 100)
+        actual_tp = avg_px * (1 + trading_cfg.tp_pct / 100)
+    else:
+        actual_sl = avg_px * (1 + trading_cfg.sl_pct / 100)
+        actual_tp = avg_px * (1 - trading_cfg.tp_pct / 100)
+
+    # Atualiza params para refletir SL/TP recalculados (afeta state e SL/TP server-side)
+    params.sl_price = round(actual_sl, 2)
+    params.tp_price = round(actual_tp, 2)
 
     # SL via TP/SL order (trigger order)
     sl_order = exchange.order(

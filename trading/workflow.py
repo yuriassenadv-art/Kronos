@@ -23,6 +23,8 @@ from trading.portfolio import allocate_capital
 from infra.ensemble_predictor import EnsemblePredictor
 from infra.state_manager import StateManager, OpenPosition
 from infra.position_watcher import sync_positions
+from infra.health_check import build_ensembles_with_retry, ensemble_health_check
+from infra.funding import refresh_funding_cache
 from infra import monitor
 
 logging.basicConfig(
@@ -349,6 +351,16 @@ def run_cycle(
             monitor.alert_error("get_account_balance", err)
             return
 
+    # 4a. Refresh do cache de funding ANTES da alocação. Falha aqui não é
+    # fatal: penalidades caem para 1.0 (sem penalidade) e o ciclo segue
+    # exatamente como antes da feature.
+    try:
+        refresh_funding_cache(cfg.hyperliquid.base_url)
+    except Exception as exc:
+        logger.warning(
+            "Falha ao atualizar funding (sem penalidade neste ciclo): %s", exc
+        )
+
     # 4. Portfolio (decisão de design do usuário — ainda NotImplementedError)
     try:
         allocations = allocate_capital(signals_filtered, balance, tcfg)
@@ -408,7 +420,13 @@ def main():
         "Carregando ensembles dos %d modelos… (pode demorar — ~111MB de pesos por coin)",
         len(cfg.trading.coins),
     )
-    ensembles = build_ensembles(cfg)
+    # Wrapper com retry: se carregamento falhar 3x consecutivos, sys.exit(1)
+    # → systemd reinicia o processo. Isolamento de falhas terminais de modelo.
+    ensembles = build_ensembles_with_retry(
+        lambda: build_ensembles(cfg),
+        max_attempts=3,
+        base_delay=5.0,
+    )
     logger.info("Ensembles prontos: %s", list(ensembles.keys()))
 
     state = StateManager()
@@ -434,6 +452,11 @@ def main():
         cfg.kronos.sample_count,
     )
 
+    # A cada N ciclos, valida saúde dos ensembles (smoke inference).
+    # Em 15m × 4 = 1h. Se 2 health checks consecutivos falharem em todos
+    # os ensembles, ensemble_health_check chama sys.exit(1) → systemd reinicia.
+    HEALTH_CHECK_INTERVAL_CYCLES = 4
+
     while True:
         cycle += 1
         try:
@@ -442,6 +465,10 @@ def main():
             err = traceback.format_exc()
             logger.error("Erro fatal no ciclo %d: %s", cycle, exc)
             monitor.alert_error(f"ciclo #{cycle}", err)
+
+        # Health check periódico — pode chamar sys.exit(1) se degradação total
+        if cycle % HEALTH_CHECK_INTERVAL_CYCLES == 0:
+            ensemble_health_check(ensembles)
 
         logger.info(
             "Próximo ciclo em %ds…", cfg.trading.loop_interval_seconds
