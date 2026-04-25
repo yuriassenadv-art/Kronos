@@ -74,3 +74,11 @@ venv.bak/
 temp/
 tmp/
 .python-version
+
+# Trading bot — datasets locais e estado
+finetune_csv/data/*.csv
+trading/.state.json
+models/
+
+# Editor / IDE local
+.claude/

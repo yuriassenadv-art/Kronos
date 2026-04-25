@@ -1,0 +1,50 @@
+# Fine-tune Kronos em ETH/USDT perpétuo Binance — 15m
+# Gerado por binance_vision_pipeline.py (sem geo-block, fonte: data.binance.vision)
+
+data:
+  data_path: "finetune_csv/data/BN_ETH_15m.csv"
+  lookback_window: 512
+  predict_window: 96
+  max_context: 512
+  clip: 5.0
+  train_ratio: 0.85
+  val_ratio: 0.10
+  test_ratio: 0.05
+
+training:
+  tokenizer_epochs: 30
+  basemodel_epochs: 20
+  batch_size: 64
+  log_interval: 50
+  num_workers: 4
+  seed: 42
+  tokenizer_learning_rate: 0.0002
+  predictor_learning_rate: 0.000001
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_weight_decay: 0.1
+  accumulation_steps: 1
+
+model_paths:
+  pretrained_tokenizer: "NeoQuasar/Kronos-Tokenizer-base"
+  pretrained_predictor: "NeoQuasar/Kronos-small"
+  exp_name: "BN_ETH_15m"
+  base_path: "finetune_csv/finetuned"
+  base_save_path: ""
+  finetuned_tokenizer: ""
+  tokenizer_save_name: "tokenizer"
+  basemodel_save_name: "basemodel"
+
+experiment:
+  name: "kronos_bn_eth_15m"
+  description: "Kronos fine-tuned on Binance ETH/USDT perpetual 15m (Binance Vision)"
+  use_comet: false
+  train_tokenizer: true
+  train_basemodel: true
+  skip_existing: false
+  pre_trained_tokenizer: true
+  pre_trained_predictor: true
+
+device:
+  use_cuda: true
+  device_id: 1
