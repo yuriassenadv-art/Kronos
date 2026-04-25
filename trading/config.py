@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -61,12 +62,25 @@ class KronosConfig:
 
 @dataclass
 class HyperliquidConfig:
-    """Credenciais e endpoint da exchange Hyperliquid."""
+    """Credenciais Hyperliquid carregadas via env vars (segurança VPS).
 
-    # Deixe private_key vazio para modo dry-run (sem ordens reais)
-    private_key: str = ""
-    account_address: str = ""
-    base_url: str = "https://api.hyperliquid.xyz"
+    Variáveis de ambiente esperadas em modo live:
+      HYPERLIQUID_PRIVATE_KEY      — chave da API wallet (NÃO usar wallet principal!)
+      HYPERLIQUID_ACCOUNT_ADDRESS  — address da wallet principal (que tem USDC)
+      HYPERLIQUID_BASE_URL         — opcional, default api.hyperliquid.xyz
+
+    Em dry_run=True estas podem ficar vazias (não há ordens reais).
+    """
+
+    private_key: str = field(
+        default_factory=lambda: os.getenv("HYPERLIQUID_PRIVATE_KEY", "")
+    )
+    account_address: str = field(
+        default_factory=lambda: os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS", "")
+    )
+    base_url: str = field(
+        default_factory=lambda: os.getenv("HYPERLIQUID_BASE_URL", "https://api.hyperliquid.xyz")
+    )
     mainnet: bool = True
 
 

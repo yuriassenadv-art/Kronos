@@ -384,6 +384,77 @@ def run_cycle(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Validação de credenciais Hyperliquid (pré-flight)
+# ─────────────────────────────────────────────────────────────────────────────
+def _validate_credentials(cfg: Config) -> None:
+    """
+    Valida credenciais Hyperliquid antes de iniciar o loop.
+
+    - dry_run=True: skip (não precisa de credenciais reais)
+    - dry_run=False:
+        1. private_key e account_address presentes (env vars)
+        2. private_key tem formato 0x... (64 hex chars)
+        3. account_address tem formato 0x... (40 hex chars)
+        4. get_account_balance retorna > $10 (saldo mínimo viável)
+
+    Em qualquer falha em modo live: sys.exit(1) — supervisor reinicia
+    se ainda assim quiser tentar (mas o erro será o mesmo até corrigir).
+    """
+    if cfg.trading.dry_run:
+        logger.info("dry_run=True — pulando validação de credenciais Hyperliquid.")
+        return
+
+    hl = cfg.hyperliquid
+
+    # Verificação 1: campos não vazios
+    if not hl.private_key or not hl.account_address:
+        logger.error(
+            "FATAL: dry_run=False mas HYPERLIQUID_PRIVATE_KEY e/ou "
+            "HYPERLIQUID_ACCOUNT_ADDRESS estão vazios. Configure as env vars "
+            "(via systemd Environment= ou export) antes de iniciar."
+        )
+        sys.exit(1)
+
+    # Verificação 2: formato (heurística simples — não valida hex)
+    if not hl.private_key.startswith("0x") or len(hl.private_key) != 66:
+        logger.error(
+            "FATAL: HYPERLIQUID_PRIVATE_KEY parece inválida (esperado 0x + 64 hex chars). "
+            "Verifique se copiou a API wallet key inteira."
+        )
+        sys.exit(1)
+
+    if not hl.account_address.startswith("0x") or len(hl.account_address) != 42:
+        logger.error(
+            "FATAL: HYPERLIQUID_ACCOUNT_ADDRESS parece inválido (esperado 0x + 40 hex chars)."
+        )
+        sys.exit(1)
+
+    # Verificação 3: saldo via API (testa conectividade + assinatura implícita)
+    try:
+        balance = get_account_balance(hl)
+        addr_short = hl.account_address[:6] + "…" + hl.account_address[-4:]
+        logger.info(
+            "✓ Auth Hyperliquid OK | account=%s | balance=$%.2f",
+            addr_short, balance,
+        )
+        if balance < 10.0:
+            logger.error(
+                "FATAL: balance=$%.2f < $10 mínimo. Deposite USDC na wallet principal "
+                "antes de operar live.",
+                balance,
+            )
+            sys.exit(1)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        logger.error(
+            "FATAL: get_account_balance falhou — credenciais ou rede. Erro: %s",
+            exc,
+        )
+        sys.exit(1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entrypoint
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
@@ -404,6 +475,9 @@ def main():
     cfg.kronos.pred_len       = 10
     cfg.kronos.sample_count   = 10
     # ─────────────────────────────────────────────────────────────────────────
+
+    # Validação de credenciais (sai com exit 1 em modo live se algo errado)
+    _validate_credentials(cfg)
 
     # Salvaguarda visível: alerta caso alguém troque dry_run para False.
     if not cfg.trading.dry_run:

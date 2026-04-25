@@ -851,6 +851,58 @@ class TestPortfolioWithFunding:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TestCredentialValidation — _validate_credentials no workflow
+# ─────────────────────────────────────────────────────────────────────────────
+class TestCredentialValidation:
+    """Cobre _validate_credentials em workflow.main."""
+
+    def test_validate_skips_in_dry_run(self, cfg):
+        from trading.workflow import _validate_credentials
+        cfg.trading.dry_run = True
+        cfg.hyperliquid.private_key = ""
+        cfg.hyperliquid.account_address = ""
+        # Não deve raise nem sys.exit
+        _validate_credentials(cfg)
+
+    def test_validate_exits_when_credentials_missing_in_live(self, cfg):
+        from trading.workflow import _validate_credentials
+        cfg.trading.dry_run = False
+        cfg.hyperliquid.private_key = ""
+        cfg.hyperliquid.account_address = ""
+        with pytest.raises(SystemExit) as exc_info:
+            _validate_credentials(cfg)
+        assert exc_info.value.code == 1
+
+    def test_validate_exits_on_malformed_private_key(self, cfg):
+        from trading.workflow import _validate_credentials
+        cfg.trading.dry_run = False
+        cfg.hyperliquid.private_key = "not_hex"
+        cfg.hyperliquid.account_address = "0x" + "a" * 40
+        with pytest.raises(SystemExit) as exc_info:
+            _validate_credentials(cfg)
+        assert exc_info.value.code == 1
+
+    def test_validate_exits_on_low_balance(self, cfg):
+        from trading.workflow import _validate_credentials
+        cfg.trading.dry_run = False
+        cfg.hyperliquid.private_key = "0x" + "a" * 64
+        cfg.hyperliquid.account_address = "0x" + "b" * 40
+        with patch("trading.workflow.get_account_balance", return_value=5.0):
+            with pytest.raises(SystemExit) as exc_info:
+                _validate_credentials(cfg)
+        assert exc_info.value.code == 1
+
+    def test_validate_passes_with_valid_credentials_and_balance(self, cfg):
+        from trading.workflow import _validate_credentials
+        cfg.trading.dry_run = False
+        cfg.hyperliquid.private_key = "0x" + "a" * 64
+        cfg.hyperliquid.account_address = "0x" + "b" * 40
+        with patch("trading.workflow.get_account_balance", return_value=500.0):
+            # Não deve raise
+            _validate_credentials(cfg)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TestWorkflowIntegration — run_cycle não crashea quando portfolio falha
 # ─────────────────────────────────────────────────────────────────────────────
 class TestWorkflowIntegration:
