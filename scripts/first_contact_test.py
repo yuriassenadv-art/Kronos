@@ -41,8 +41,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Tamanho mínimo da ordem em USD (a Hyperliquid exige >= $10 em geral)
-TEST_SIZE_USD = 12.0
+# Tamanho mínimo da ordem em USD (a Hyperliquid exige >= $10 em geral).
+# Ajustado para $10.5 — cabe em conta com $19 USDC e mantém buffer para fees.
+TEST_SIZE_USD = 10.5
 TEST_SL_PCT = 5.0   # SL/TP largos pra não disparar durante o teste
 TEST_TP_PCT = 5.0
 LEVERAGE = 1

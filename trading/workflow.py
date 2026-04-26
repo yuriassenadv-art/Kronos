@@ -461,14 +461,22 @@ def main():
     cfg = Config()
 
     # ── Configuração ─────────────────────────────────────────────────────────
-    cfg.trading.coins         = ["BTC", "ETH", "SOL"]
+    # ⚠️ MODO MICRO-CAPITAL ($19 USDC inicial) — ajustes para ficar acima do
+    # mínimo de ordem da Hyperliquid (~$10 notional). Trade-offs:
+    #   - 1 coin só (BTC) — capital insuficiente para multi-asset
+    #   - leverage 6x — cobre o mínimo de notional sem inflar risco bruto
+    #   - risk_per_trade_pct 10% × leverage 6 × balance $19 = ~$11.4 notional
+    #   - SL 1.0% / TP 2.0% — perda real ~$0.11/trade, ganho ~$0.23/trade (R:R 1:2)
+    # Ao depositar mais capital ($100+), restaure: coins=["BTC","ETH","SOL"],
+    # leverage=3, risk_per_trade_pct=1.0, sl_pct=1.5, tp_pct=3.0.
+    cfg.trading.coins         = ["BTC"]
     cfg.trading.interval      = "15m"     # timeframe nativo dos modelos savycorp
     cfg.trading.dry_run       = True      # ⚠️ NUNCA commite com False
-    cfg.trading.leverage      = 3
-    cfg.trading.risk_per_trade_pct = 1.0
-    cfg.trading.sl_pct        = 1.5
-    cfg.trading.tp_pct        = 3.0
-    cfg.trading.max_concurrent_positions = 3
+    cfg.trading.leverage      = 6
+    cfg.trading.risk_per_trade_pct = 10.0
+    cfg.trading.sl_pct        = 1.0
+    cfg.trading.tp_pct        = 2.0
+    cfg.trading.max_concurrent_positions = 1
     cfg.trading.loop_interval_seconds = 900   # 15min
 
     cfg.kronos.lookback       = 200
