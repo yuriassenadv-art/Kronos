@@ -5,6 +5,7 @@ Instale: pip install hyperliquid-python-sdk
 """
 
 import logging
+import math
 from typing import Optional
 
 from hyperliquid.info import Info
@@ -59,6 +60,32 @@ def _round_qty(coin: str, qty_raw: float, base_url: str) -> float:
     return round(qty_raw, decimals)
 
 
+def _round_price(price: float, sz_decimals: int) -> float:
+    """
+    Arredonda preço conforme regras de tick da Hyperliquid:
+      - max (6 - sz_decimals) decimal places
+      - max 5 significant figures
+
+    A regra mais restritiva (menor precisão) ganha. Sem esse arredondamento
+    a exchange rejeita SL/TP com `{"error": "Order has invalid price."}`
+    para ativos cujo szDecimals não permite a precisão default que o
+    Python `round(x, 2)` produz (ex: BTC szDecimals=5 → max 1 decimal).
+    """
+    if price <= 0:
+        return 0.0
+
+    max_decimals = max(0, 6 - sz_decimals)
+
+    # Calcula precisão por sig figs: 5 sig figs total, parte inteira já
+    # consome (magnitude+1) dígitos, sobra (4 - magnitude) para os decimais.
+    magnitude = int(math.floor(math.log10(abs(price))))
+    sig_fig_decimals = max(0, 4 - magnitude)
+
+    # A regra mais restritiva ganha
+    precision = min(max_decimals, sig_fig_decimals)
+    return round(price, precision)
+
+
 def clear_decimals_cache() -> None:
     """Reset do cache de szDecimals — útil em testes."""
     global _SZ_DECIMALS_CACHE
@@ -68,25 +95,30 @@ def clear_decimals_cache() -> None:
 @retry_on_network_error(max_attempts=3, base_delay=1.0)
 def get_account_balance(hl_cfg: HyperliquidConfig) -> float:
     """
-    Retorna o saldo USDC disponível para trading.
+    Retorna capital LIVRE disponível para abrir novas posições.
 
-    Suporta dois modos da Hyperliquid:
-      - Classic Account: USDC vive em `user_state.marginSummary.accountValue`
-        (legacy perp account). Spot é separado.
-      - Unified Account: USDC fica em spot mas é usado como margem perp
-        automaticamente. Nesse caso `marginSummary.accountValue` retorna 0
-        e o saldo real está em `spot_user_state.balances[USDC].total`.
+    Suporta dois modos da Hyperliquid (sem double-counting):
+      - Classic Account: capital livre vive em `user_state.withdrawable`
+        (perp account). `spot_user_state` retorna 0.
+      - Unified Account sem posições abertas: spot USDC é o saldo real;
+        `withdrawable` retorna 0.
+      - Unified Account com posições: spot USDC continua representando o
+        capital alocado (o débito real só acontece em PnL/fees), e
+        `withdrawable` reflete margem após alocação.
 
-    Para ser robusto a ambos os modos (e evitar trocar a conta toda vez),
-    somamos perp account value + spot USDC. Em Classic mode com saldo só
-    em perp, o spot é 0; em Unified, o perp é 0 mas spot tem o valor real.
-    Em modo híbrido (raro), soma ambos sem double-counting.
+    Estratégia: pega o MAIOR entre `withdrawable` e `spot_usdc`.
+      * Em Classic, withdrawable > 0 e spot_usdc = 0 → vence withdrawable.
+      * Em Unified sem posições, withdrawable = 0 e spot_usdc > 0 → vence spot.
+      * Em Unified com posições, withdrawable < spot_usdc (parte da margem
+        está alocada) → vence spot_usdc, que é o capital real disponível.
+
+    Sem essa lógica, somar ambos resultaria em double-counting em Unified
+    Account (smoke test: $19.98 spot + $10.84 perp = $30.82 falso).
     """
     info = Info(hl_cfg.base_url, skip_ws=True)
 
-    # Perp account value (Classic mode)
     state = info.user_state(hl_cfg.account_address)
-    perp_value = float(state.get("marginSummary", {}).get("accountValue", 0))
+    withdrawable = float(state.get("withdrawable", 0))
 
     # Spot USDC (Unified mode usa esse como margem)
     try:
@@ -100,12 +132,13 @@ def get_account_balance(hl_cfg: HyperliquidConfig) -> float:
         logger.warning("Falha ao consultar spot_user_state: %s", exc)
         spot_usdc = 0.0
 
-    total = perp_value + spot_usdc
+    # Pega o maior — evita double-count em Unified Account
+    available = max(withdrawable, spot_usdc)
     logger.debug(
-        "Balance breakdown: perp=$%.2f + spot_usdc=$%.2f = total=$%.2f",
-        perp_value, spot_usdc, total,
+        "Balance: withdrawable=$%.2f | spot_usdc=$%.2f | available=$%.2f",
+        withdrawable, spot_usdc, available,
     )
-    return total
+    return available
 
 
 def place_order(
@@ -224,9 +257,13 @@ def place_order(
         actual_sl = avg_px * (1 + trading_cfg.sl_pct / 100)
         actual_tp = avg_px * (1 - trading_cfg.tp_pct / 100)
 
-    # Atualiza params para refletir SL/TP recalculados (afeta state e SL/TP server-side)
-    params.sl_price = round(actual_sl, 2)
-    params.tp_price = round(actual_tp, 2)
+    # Arredondar SL/TP segundo a regra de tick da Hyperliquid (Bug #1):
+    # round(x, 2) genérico quebra para coins com szDecimals alto (BTC=5
+    # → max 1 decimal). Sem isso, a exchange devolve
+    # `{"error": "Order has invalid price."}` e perdemos as proteções.
+    sz_decimals = _load_sz_decimals(hl_cfg.base_url).get(params.coin, 4)
+    params.sl_price = _round_price(actual_sl, sz_decimals)
+    params.tp_price = _round_price(actual_tp, sz_decimals)
 
     # SL via TP/SL order (trigger order)
     sl_order = exchange.order(

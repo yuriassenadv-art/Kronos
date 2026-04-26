@@ -146,8 +146,52 @@ def main():
             account,
             constants.MAINNET_API_URL if cfg.hyperliquid.mainnet else constants.TESTNET_API_URL,
         )
-        close_result = exchange.market_close(coin)
-        logger.info("Fechamento: %s", close_result)
+
+        # Bug #2: market_close retornou None silenciosamente no smoke test.
+        # Buscamos o size atual da posição via user_state e passamos
+        # explicitamente. Se ainda assim falhar, fallback para ordem reverse
+        # com reduce_only=True.
+        state = info.user_state(cfg.hyperliquid.account_address)
+        positions = state.get("assetPositions", [])
+        coin_pos = next(
+            (p["position"] for p in positions
+             if p.get("position", {}).get("coin") == coin),
+            None,
+        )
+
+        if coin_pos is None:
+            logger.warning(
+                "Posição %s não consta em assetPositions — pode já estar fechada.",
+                coin,
+            )
+            close_result = {"status": "ok", "note": "no_position"}
+        else:
+            szi = float(coin_pos["szi"])
+            pos_size = abs(szi)
+            logger.info("Fechando posição %s size=%.6f (szi=%.6f)…",
+                        coin, pos_size, szi)
+
+            close_result = exchange.market_close(coin, sz=pos_size)
+            logger.info("Resultado market_close: %s", close_result)
+
+            if (close_result is None
+                    or (isinstance(close_result, dict)
+                        and close_result.get("status") != "ok")):
+                logger.warning(
+                    "market_close falhou (resp=%s); tentando ordem reverse "
+                    "com reduce_only=True…",
+                    close_result,
+                )
+                # Se a posição é SHORT (szi < 0), reverse é BUY; se LONG, SELL.
+                is_buy_inverse = szi < 0
+                close_result = exchange.market_open(
+                    coin,
+                    is_buy_inverse,
+                    pos_size,
+                    slippage=0.02,
+                    reduce_only=True,
+                )
+                logger.info("Resultado fallback reverse: %s", close_result)
     except Exception as exc:
         logger.error(
             "WARN — falha ao fechar a posição automaticamente: %s. "
@@ -155,8 +199,29 @@ def main():
         )
         sys.exit(1)
 
+    # Verificação pós-close: confirma que a posição não está mais aberta
+    time.sleep(3)
+    try:
+        state_after = info.user_state(cfg.hyperliquid.account_address)
+        positions_after = state_after.get("assetPositions", [])
+        still_open = any(
+            p.get("position", {}).get("coin") == coin
+            and abs(float(p.get("position", {}).get("szi", 0))) > 0
+            for p in positions_after
+        )
+        if still_open:
+            logger.error(
+                "POSIÇÃO %s AINDA ABERTA — feche MANUALMENTE em "
+                "app.hyperliquid.xyz!", coin,
+            )
+            sys.exit(1)
+        logger.info("Posição %s confirmada FECHADA na exchange.", coin)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        logger.warning("Falha ao verificar fechamento: %s", exc)
+
     # Confere balance final
-    time.sleep(2)
     try:
         balance_after = get_account_balance(cfg.hyperliquid)
         logger.info(

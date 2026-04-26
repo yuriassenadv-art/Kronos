@@ -903,6 +903,110 @@ class TestCredentialValidation:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TestPriceRounding — _round_price (Bug #1: SL/TP price tick rounding)
+# ─────────────────────────────────────────────────────────────────────────────
+class TestPriceRounding:
+    """Cobre _round_price para regras de tick da Hyperliquid.
+
+    Regras:
+      - max (6 - sz_decimals) decimal places
+      - max 5 significant figures
+    A regra mais restritiva (menor precisão) ganha.
+    """
+
+    def test_btc_high_price_rounds_to_integer(self):
+        from trading.order_executor import _round_price
+        # BTC szDecimals=5 → max 1 decimal AND 5 sig figs.
+        # 77485.55: magnitude=4 → sig_fig_decimals = 4-4 = 0 → integer.
+        # min(1, 0) = 0 → arredonda para inteiro
+        result = _round_price(77485.55, 5)
+        assert result == 77486 or result == 77485
+
+    def test_eth_mid_price_one_decimal(self):
+        from trading.order_executor import _round_price
+        # ETH szDecimals=4 → max 2 decimals AND 5 sig figs.
+        # 3500.567: magnitude=3 → sig_fig_decimals = 4-3 = 1.
+        # min(2, 1) = 1 decimal → 3500.6
+        result = _round_price(3500.567, 4)
+        assert result == pytest.approx(3500.6, abs=0.01)
+
+    def test_sol_low_price_two_decimals(self):
+        from trading.order_executor import _round_price
+        # SOL szDecimals=2 → max 4 decimals AND 5 sig figs.
+        # 145.327: magnitude=2 → sig_fig_decimals = 4-2 = 2.
+        # min(4, 2) = 2 decimal → 145.33
+        result = _round_price(145.327, 2)
+        assert result == pytest.approx(145.33, abs=0.01)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestUnifiedAccountBalance — get_account_balance (Bug #3: double-count fix)
+# ─────────────────────────────────────────────────────────────────────────────
+class TestUnifiedAccountBalance:
+    """Cobre get_account_balance em modo Unified vs Classic.
+
+    Garante que NÃO há double-count quando há posição aberta em conta
+    Unified (smoke test mostrou $19.98 + $10.84 = $30.82 falso).
+    """
+
+    def test_classic_account_uses_withdrawable(self):
+        from trading.order_executor import get_account_balance
+        from trading.config import HyperliquidConfig
+
+        with patch("trading.order_executor.Info") as mock_info_cls:
+            mock_info = MagicMock()
+            mock_info.user_state.return_value = {
+                "marginSummary": {"accountValue": "100.0"},
+                "withdrawable": "100.0",
+            }
+            mock_info.spot_user_state.return_value = {"balances": []}
+            mock_info_cls.return_value = mock_info
+
+            balance = get_account_balance(HyperliquidConfig())
+            assert balance == pytest.approx(100.0)
+
+    def test_unified_account_no_position_uses_spot_usdc(self):
+        from trading.order_executor import get_account_balance
+        from trading.config import HyperliquidConfig
+
+        with patch("trading.order_executor.Info") as mock_info_cls:
+            mock_info = MagicMock()
+            mock_info.user_state.return_value = {
+                "marginSummary": {"accountValue": "0.0"},
+                "withdrawable": "0.0",
+            }
+            mock_info.spot_user_state.return_value = {
+                "balances": [{"coin": "USDC", "total": "19.98"}]
+            }
+            mock_info_cls.return_value = mock_info
+
+            balance = get_account_balance(HyperliquidConfig())
+            assert balance == pytest.approx(19.98)
+
+    def test_unified_account_with_position_no_double_count(self):
+        from trading.order_executor import get_account_balance
+        from trading.config import HyperliquidConfig
+
+        # Cenário do incidente real: $19.98 spot, $10 alocado em posição perp.
+        # Soma = $29.98 (errado); max = $19.98 (correto — capital real).
+        with patch("trading.order_executor.Info") as mock_info_cls:
+            mock_info = MagicMock()
+            mock_info.user_state.return_value = {
+                "marginSummary": {"accountValue": "10.0"},
+                "withdrawable": "9.98",  # margem após alocação
+            }
+            mock_info.spot_user_state.return_value = {
+                "balances": [{"coin": "USDC", "total": "19.98"}]
+            }
+            mock_info_cls.return_value = mock_info
+
+            balance = get_account_balance(HyperliquidConfig())
+            # max(9.98, 19.98) = 19.98 — NÃO 29.98
+            assert balance == pytest.approx(19.98)
+            assert balance < 25.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TestWorkflowIntegration — run_cycle não crashea quando portfolio falha
 # ─────────────────────────────────────────────────────────────────────────────
 class TestWorkflowIntegration:
