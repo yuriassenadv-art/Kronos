@@ -67,10 +67,45 @@ def clear_decimals_cache() -> None:
 
 @retry_on_network_error(max_attempts=3, base_delay=1.0)
 def get_account_balance(hl_cfg: HyperliquidConfig) -> float:
-    """Retorna o saldo USDC disponível na conta."""
+    """
+    Retorna o saldo USDC disponível para trading.
+
+    Suporta dois modos da Hyperliquid:
+      - Classic Account: USDC vive em `user_state.marginSummary.accountValue`
+        (legacy perp account). Spot é separado.
+      - Unified Account: USDC fica em spot mas é usado como margem perp
+        automaticamente. Nesse caso `marginSummary.accountValue` retorna 0
+        e o saldo real está em `spot_user_state.balances[USDC].total`.
+
+    Para ser robusto a ambos os modos (e evitar trocar a conta toda vez),
+    somamos perp account value + spot USDC. Em Classic mode com saldo só
+    em perp, o spot é 0; em Unified, o perp é 0 mas spot tem o valor real.
+    Em modo híbrido (raro), soma ambos sem double-counting.
+    """
     info = Info(hl_cfg.base_url, skip_ws=True)
+
+    # Perp account value (Classic mode)
     state = info.user_state(hl_cfg.account_address)
-    return float(state["marginSummary"]["accountValue"])
+    perp_value = float(state.get("marginSummary", {}).get("accountValue", 0))
+
+    # Spot USDC (Unified mode usa esse como margem)
+    try:
+        spot = info.spot_user_state(hl_cfg.account_address)
+        spot_usdc = sum(
+            float(b.get("total", 0))
+            for b in spot.get("balances", [])
+            if b.get("coin") == "USDC"
+        )
+    except Exception as exc:
+        logger.warning("Falha ao consultar spot_user_state: %s", exc)
+        spot_usdc = 0.0
+
+    total = perp_value + spot_usdc
+    logger.debug(
+        "Balance breakdown: perp=$%.2f + spot_usdc=$%.2f = total=$%.2f",
+        perp_value, spot_usdc, total,
+    )
+    return total
 
 
 def place_order(
